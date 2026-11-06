@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# slurmtop [INTERVAL] [--once]: live view of your Slurm jobs, their priority, how busy the
+# GPU partitions are, and your storage.
+#   INTERVAL: 1s to 1h, as 30, 30s, 5m or 1h (default 1m). Keys: r refresh now, q quit.
+#   --once: print one screen and exit.
+# Runs on a cluster login node, or on any other machine through ssh (set SLURMTOP_HOST; one
+# shared connection is reused). Slurm is asked at most every 15 s whatever the interval
+# (lighter on the scheduler); storage every 10 min. Other users appear only as counts.
+# Settings (environment variables):
+#   SLURMTOP_HOST        ssh host to run the Slurm commands on, when Slurm is not installed here
+#   SLURMTOP_PARTITIONS  GPU partitions to show (default: those your accounts may use)
+#   SLURMTOP_ACCOUNT     account for the fair-share figure (default: all of yours)
+#   SLURMTOP_PATHS       paths on the cluster to show storage for; ~ and $USER are expanded
+#                        there (default: ~)
+HOST=${SLURMTOP_HOST:-}
+MIN_QUERY=15 STORAGE_EVERY=600
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/slurmtop-%C" -o ControlPersist=15m)
+
+interval=60 once=0
+for a in "$@"; do
+  case "$a" in
+    --once) once=1 ;;
+    -h|--help) awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0"; exit 0 ;;
+    *) n=${a%[smhSMH]}; u=${a#"$n"}
+       [[ "$n" =~ ^[0-9]+$ ]] || { echo "interval must look like 30, 30s, 5m or 1h" >&2; exit 1; }
+       case "${u,,}" in m) n=$((n * 60)) ;; h) n=$((n * 3600)) ;; esac
+       (( n < 1 )) && n=1; (( n > 3600 )) && n=3600; interval=$n ;;
+  esac
+done
+
+if ! command -v squeue > /dev/null && [ -z "$HOST" ]; then
+  echo "slurmtop: Slurm is not installed here; set SLURMTOP_HOST to an ssh host of your cluster" >&2
+  exit 1
+fi
+
+# Colors only on a terminal: a 256-color palette when available, basic colors otherwise.
+B= D= R= RED= GRN= YEL= CYN= FG_OFF= FG_LBL= FG_TXT= FG_TITLE= DOWNC=
+BOX_JOBS= BOX_PRIO= BOX_PART= BOX_DISK=
+GC=("" "" "" "" "" "" "" "" "" "")
+ncolors=$(tput colors 2>/dev/null || echo 0)
+if [ -t 1 ] && [ "$ncolors" -ge 8 ]; then
+  B=$(tput bold) D=$(tput dim) R=$'\e[0m' RED=$(tput setaf 1) GRN=$(tput setaf 2) YEL=$(tput setaf 3) CYN=$(tput setaf 6)
+  if [ "$ncolors" -ge 256 ]; then
+    GC=(); for c in 41 77 113 149 185 221 215 209 203 197; do GC+=($'\e[38;5;'"$c"'m'); done  # green -> red
+    FG_OFF=$'\e[38;5;237m' FG_LBL=$'\e[38;5;245m' FG_TXT=$'\e[38;5;252m' FG_TITLE=$'\e[1;38;5;231m'
+    DOWNC=$'\e[38;5;136m' GRN=$'\e[38;5;41m' YEL=$'\e[38;5;221m'
+    BOX_JOBS=$'\e[38;5;72m' BOX_PRIO=$'\e[38;5;179m' BOX_PART=$'\e[38;5;104m' BOX_DISK=$'\e[38;5;174m'
+  else
+    GC=("$GRN" "$GRN" "$GRN" "$GRN" "$YEL" "$YEL" "$YEL" "$RED" "$RED" "$RED")
+    FG_OFF=$D FG_LBL=$D FG_TITLE=$B DOWNC=$YEL BOX_JOBS=$CYN BOX_PRIO=$CYN BOX_PART=$CYN BOX_DISK=$CYN
+  fi
+fi
+# Glyphs: colored meters tell used/down/free apart by color, plain ones by shape.
+if [ "$(locale charmap 2>/dev/null)" = UTF-8 ]; then
+  TL="╭" TR="╮" BL="╰" BRC="╯" V="│" H="─" LT="┤" RT="├"
+  if [ -n "$R" ]; then FULL="■" PART="■" EMPTY="■"; else FULL="█" PART="▒" EMPTY="░"; fi
+else
+  TL="+" TR="+" BL="+" BRC="+" V="|" H="-" LT="|" RT="|" FULL="#" PART="x" EMPTY="."
+fi
+
+bar() {  # bar WIDTH USED DOWN TOTAL : used (gradient) | down (amber) | free (dark)
+  local w=$1 u=$2 d=$3 t=$4 nu nd i s=""
+  (( t <= 0 )) && { printf '%*s' "$w" ''; return; }
+  nu=$(( (u * w + t / 2) / t )); nd=$(( (d * w + t / 2) / t ))
+  (( u > 0 && nu == 0 )) && nu=1; (( d > 0 && nd == 0 )) && nd=1   # never hide a nonzero amount
+  (( nu > w )) && nu=$w; (( nu + nd > w )) && nd=$(( w - nu ))
+  for (( i = 0; i < w; i++ )); do
+    if (( i < nu )); then s+="${GC[i * 10 / w]}$FULL"
+    elif (( i < nu + nd )); then s+="$DOWNC$PART"
+    else s+="$FG_OFF$EMPTY"; fi
+  done
+  printf '%s%s' "$s" "$R"
+}
+
+vis() {  # vis TEXT: TEXT without color codes
+  local s=$1 re=$'\e''(\[[0-9;]*m|\(B)'
+  while [[ $s =~ $re ]]; do s=${s/"${BASH_REMATCH[0]}"/}; done
+  printf '%s' "$s"
+}
+
+fitc() {  # fitc TEXT WIDTH: TEXT padded or cut (with …) to WIDTH visible columns, colors kept
+  local s=$1 w=$2 plain out="" n=0 esc=$'^(\e\\[[0-9;]*m|\e\\(B)'
+  plain=$(vis "$s")
+  if (( ${#plain} <= w )); then printf '%s%*s' "$s" $(( w - ${#plain} )) ''; return 0; fi
+  while (( n < w - 1 )) && [[ -n $s ]]; do
+    if [[ $s =~ $esc ]]; then out+=${BASH_REMATCH[1]}; s=${s:${#BASH_REMATCH[1]}}
+    else out+=${s:0:1}; s=${s:1}; n=$(( n + 1 )); fi
+  done
+  printf '%s%s…' "$out" "$R"
+}
+
+repeat() { local s; printf -v s '%*s' "$2" ''; printf '%s' "${s// /$1}"; }
+
+# Panels: box_top COLOR LEFT [RIGHT] draws "╭─┤ LEFT ├────┤ RIGHT ├─╮" and sets the panel
+# color; box_line TEXT draws one row (cut to fit); box_bottom [HINT] closes the panel.
+box_top() {
+  BC=$1
+  local l=$2 r=${3:-} n lv
+  lv=$(vis "$l"); n=$(( cols - 7 - ${#lv} ))
+  if [ -n "$r" ]; then lv=$(vis "$r"); n=$(( n - 5 - ${#lv} )); fi
+  (( n < 1 )) && n=1
+  printf '%s%s%s%s %s%s%s%s %s%s' "$BC" "$TL" "$H" "$LT" "$FG_TITLE" "$l" "$R" "$BC" "$RT" "$(repeat "$H" "$n")"
+  [ -n "$r" ] && printf '%s %s%s%s%s %s%s' "$LT" "$FG_LBL" "$r" "$R" "$BC" "$RT" "$H"
+  printf '%s%s\n' "$TR" "$R"
+}
+box_line() { printf '%s%s%s %s %s%s%s\n' "$BC" "$V" "$R" "$(fitc "$1" $(( cols - 4 )))" "$BC" "$V" "$R"; }
+box_lines() { local l; while IFS= read -r l; do box_line "$l"; done; }   # box_line for each input line
+box_bottom() {
+  local h=${1:-} n hv
+  if [ -n "$h" ]; then
+    hv=$(vis "$h"); n=$(( cols - 7 - ${#hv} )); (( n < 1 )) && n=1
+    printf '%s%s%s%s %s%s%s%s %s%s%s%s\n' "$BC" "$BL" "$H" "$LT" "$FG_LBL" "$h" "$R" "$BC" "$RT" "$(repeat "$H" "$n")" "$BRC" "$R"
+  else
+    printf '%s%s%s%s%s\n' "$BC" "$BL" "$(repeat "$H" $(( cols - 2 )))" "$BRC" "$R"
+  fi
+}
+
+# squeue rows "a|b|..." -> columns just as wide as their content, numbers right-aligned,
+# state colored, two spaces between columns (one if that does not fit in MAXW); lines that
+# are not table rows (such as errors) are printed as they are
+jobs_table() {
+  awk -F'|' -v D="$FG_LBL" -v R="$R" -v G="$GRN" -v Y="$YEL" -v MAXW="$(( cols - 4 ))" '
+    BEGIN { split("JOBID NAME PARTITION ST TIME LIMIT CPUS MEM TRES PRIO START NODES(REASON)", head, " ")
+            split("5 6 7 8 10", num, " "); for (k in num) right[num[k]] = 1 }
+    NF < 12 { line[++n] = $0; continue_row[n] = 1; next }
+    { n++; rows++
+      for (i = 1; i <= 12; i++) {
+        v = (rows == 1) ? head[i] : $i
+        if (rows > 1 && i == 2) v = substr(v, 1, 16)
+        if (rows > 1 && i == 9) gsub(/gres\//, "", v)
+        if (rows > 1 && i == 11 && v ~ /^[0-9][0-9][0-9][0-9]-/) v = substr(v, 6, 5) " " substr(v, 12, 5)
+        cell[n, i] = v; if (length(v) > wd[i]) wd[i] = length(v)
+      }
+      hdr[n] = (rows == 1) }
+    END {
+      for (i = 1; i <= 12; i++) tw += wd[i]
+      gap = (tw + 22 <= MAXW) ? "  " : " "
+      for (r = 1; r <= n; r++) {
+        if (continue_row[r]) { print line[r]; continue }
+        out = (hdr[r] ? D : "")
+        for (i = 1; i <= 12; i++) {
+          v = cell[r, i]; c = ""
+          if (!hdr[r] && i == 4) c = (v == "R") ? G : (v == "PD") ? Y : ""
+          f = (i == 12) ? "%s" : (right[i] ? "%" wd[i] "s" : "%-" wd[i] "s")
+          out = out (c != "" ? c sprintf(f, v) R : sprintf(f, v)) (i < 12 ? gap : "")
+        }
+        print out (hdr[r] ? R : "")
+      }
+    }'
+}
+
+# The Slurm queries, run on the cluster (directly, or through ssh) after a line that sets
+# ACCOUNT, PARTS, PATHS and WANT; output sections start with @@NAME.
+read -r -d '' COLLECT <<'EOF'
+echo "@@USER"; echo "$USER"
+echo "@@CLUSTER"; scontrol show config 2>/dev/null | awk -F= '/^ClusterName/ {gsub(/ /, "", $2); print $2}'
+echo "@@MYJOBS"; squeue -u "$USER" -o "%i|%j|%P|%t|%M|%l|%C|%m|%b|%Q|%S|%R" 2>&1
+echo "@@MYSTATES"; squeue -u "$USER" --array -h -o "%T|%b" 2>/dev/null
+echo "@@PRIO"; sprio -u "$USER" -h -o "%.15i %.9r  priority %.6Y   fair-share %.5F   QoS %.4Q   age %.4A" 2>/dev/null
+echo "@@FS"; sshare -h -U -u "$USER" ${ACCOUNT:+-A "$ACCOUNT"} -o Account,FairShare -P 2>/dev/null
+echo "@@PENDING"; squeue -h -t PD -o "%P" 2>/dev/null | tr ',' '\n' | sort | uniq -c   # a job may wait in several
+NODES=$(scontrol -o show nodes 2>/dev/null)
+echo "@@NODES"; printf '%s\n' "$NODES"
+echo "@@PARTS"
+if [ -n "$PARTS" ]; then
+  printf '%s\n' $PARTS
+else  # GPU partitions (from the nodes) that your accounts and groups may use
+  gpu=$(printf '%s\n' "$NODES" | awk '/CfgTRES=[^ ]*gres\/gpu=[1-9]/ && match($0, /Partitions=[^ ]+/) { printf "%s,", substr($0, RSTART + 11, RLENGTH - 11) }')
+  accts=$(sshare -h -U -u "$USER" -o Account -P 2>/dev/null | tr '\n' ',')
+  scontrol -o show partition 2>/dev/null | awk -v GPU="$gpu" -v A="$accts" -v G="$(id -Gn | tr ' ' ',')" '
+    function field(k,   v) { v = ""; if (match($0, k "=[^ ]+")) v = substr($0, RSTART + length(k) + 1, RLENGTH - length(k) - 1); return v }
+    function any(list, set,   n, x, i) { n = split(list, x, ","); for (i = 1; i <= n; i++) if (x[i] in set) return 1; return 0 }
+    BEGIN { n = split(GPU, x, ","); for (i = 1; i <= n; i++) if (x[i] != "") gpu[x[i]] = 1
+            n = split(A, x, ","); for (i = 1; i <= n; i++) if (x[i] != "") acct[x[i]] = 1
+            n = split(G, x, ","); for (i = 1; i <= n; i++) if (x[i] != "") grp[x[i]] = 1 }
+    { p = field("PartitionName"); if (!(p in gpu)) next
+      aa = field("AllowAccounts"); ag = field("AllowGroups"); da = field("DenyAccounts")
+      if (aa != "" && aa != "ALL" && !any(aa, acct)) next
+      if (ag != "" && ag != "ALL" && !any(ag, grp)) next
+      if (da != "" && any(da, acct)) next
+      print p }'
+fi
+if [ "$WANT" = storage ]; then
+  echo "@@STORAGE"
+  for p in $PATHS; do
+    p=${p/#\~/$HOME}; p=${p//\$USER/$USER}
+    timeout 10 df -hP "$p" 2>/dev/null | awk -v P="$p" 'NR == 2 {sub(/%/, "", $5); print P, $2, $3, $5}'
+  done
+fi
+EOF
+section() { awk -v S="@@$1" '$0 == S {on = 1; next} /^@@[A-Z]+$/ {on = 0} on' <<< "$RAW"; }
+
+last_query=0 last_storage=0
+query() {
+  local now want=nostorage script
+  now=$(date +%s)
+  (( now - last_query < MIN_QUERY && last_query > 0 )) && return
+  last_query=$now
+  (( now - last_storage >= STORAGE_EVERY )) && want=storage
+  (( once )) || printf '%s%s%s' "$HOME_" "$(header "${YEL}updating…$R")" "$EL"  # keep the old screen, flag the wait
+  script=$(printf 'ACCOUNT=%q PARTS=%q PATHS=%q WANT=%q\n' "${SLURMTOP_ACCOUNT:-}" "${SLURMTOP_PARTITIONS:-}" \
+    "${SLURMTOP_PATHS:-~}" "$want"; printf '%s\n' "$COLLECT")
+  if command -v squeue > /dev/null; then RAW=$(bash -c "$script")
+  else RAW=$("${SSH[@]}" "$HOST" bash -s <<< "$script" 2>&1)
+  fi
+  if ! grep -q '^@@NODES$' <<< "$RAW"; then
+    MYJOBS="(could not reach the cluster: $(head -n 2 <<< "$RAW" | tr '\n' ' '))"; return
+  fi
+  CUSER=$(section USER); CLUSTER=$(section CLUSTER); MYJOBS=$(section MYJOBS); MYSTATES=$(section MYSTATES)
+  PRIO=$(section PRIO); FS=$(section FS); PENDING_BY_PART=$(section PENDING); NODES=$(section NODES)
+  PARTLIST=$(section PARTS)
+  if [ "$want" = storage ]; then last_storage=$now; STORAGE=$(section STORAGE); fi
+}
+
+size() { cols=$(tput cols 2>/dev/null || echo 100); (( cols < 60 )) && cols=60; }
+
+header() {  # header [STATUS]: top border of the first panel, with an optional status such as "updating…"
+  [ -n "${cols:-}" ] || size
+  box_top "$BOX_JOBS" "${CLUSTER:-slurm}" "${CUSER:-?} · $(date '+%F %T') · refresh ${interval}s (Slurm every $(( interval > MIN_QUERY ? interval : MIN_QUERY ))s)${1:+ · $1}"
+}
+
+draw() {
+  local w r p g fr fs part pw=9
+  size
+  for part in $PARTLIST; do (( ${#part} > pw )) && pw=${#part}; done   # partition name column
+  (( pw > 20 )) && pw=20
+  w=$(( cols - 61 - pw )); (( w > 50 )) && w=50; (( w < 10 )) && w=10   # leaves room for the text after the meters
+
+  header
+  r=$(grep -c '^RUNNING' <<< "$MYSTATES"); p=$(grep -c '^PENDING' <<< "$MYSTATES")
+  g=$(grep '^RUNNING' <<< "$MYSTATES" | grep -o 'gpu[:a-z0-9]*' | awk -F: '{n += ($NF ~ /^[0-9]+$/ ? $NF : 1)} END {print n+0}')
+  box_line "${B}my jobs$R  $(bar 20 "$r" 0 $(( r + p )))  $GRN$r$R of $(( r + p )) running · $YEL$p$R pending · $B$g$R GPUs in use"
+  jobs_table <<< "$MYJOBS" | box_lines
+  box_bottom
+
+  box_top "$BOX_PRIO" "priority (higher starts sooner)"
+  if [ -n "$PRIO" ]; then box_lines <<< "$PRIO"; else box_line "${FG_LBL}(no pending jobs waiting on priority)$R"; fi
+  fs=$(awk -F'|' 'NF == 2 && $1 != "" {printf "%s%s %.3f", (n++ ? " · " : ""), $1, $2}' <<< "$FS")
+  box_line "${FG_LBL}fair-share$R  ${fs:-?}  ${FG_LBL}(1 = share unused, 0 = used up)$R"
+  box_bottom
+
+  box_top "$BOX_PART" "gpu partitions · all users" "${GC[9]}$FULL$R used  $DOWNC$PART$R down  $FG_OFF$EMPTY$R free"
+  for part in $PARTLIST; do
+    read -r n T U Dn I <<< "$(awk -v P="$part" '
+      $0 ~ "Partitions=([^ ]*,)?"P"(,| |$)" {
+        tot = 0; use = 0; st = ""
+        if (match($0, /CfgTRES=[^ ]*gres\/gpu=[0-9]+/)) { s = substr($0, RSTART, RLENGTH); sub(/.*gres\/gpu=/, "", s); tot = s + 0 }
+        if (match($0, /AllocTRES=[^ ]*gres\/gpu=[0-9]+/)) { s = substr($0, RSTART, RLENGTH); sub(/.*gres\/gpu=/, "", s); use = s + 0 }
+        if (match($0, /State=[^ ]+/)) st = substr($0, RSTART + 6, RLENGTH - 6)
+        n++; T += tot; U += use
+        if (st ~ /DOWN|DRAIN|FAIL|MAINT|NOT_RESPONDING/) D += tot - use; else if (st ~ /^IDLE/) I++
+      }
+      END { printf "%d %d %d %d %d", n, T, U, D, I }' <<< "$NODES")"
+    wt=$(awk -v P="$part" '$2 == P {print $1}' <<< "$PENDING_BY_PART"); wt=${wt:-0}
+    fr=$(( T - U - Dn ))
+    box_line "$(printf '%s%-*s%s %s %3s/%-3s used %s%3s free%s  %2s idle nodes  %4s jobs waiting' "$B" "$pw" "$part" "$R" \
+      "$(bar "$w" "$U" "$Dn" "$T")" "$U" "$T" "$( (( fr > 0 )) && printf '%s' "$GRN")" "$fr" "$R" "$I" "$wt")"
+  done
+  if [ -n "$PARTLIST" ]; then
+    box_line "${FG_LBL}(free GPUs can still be unusable if their node has no free CPUs or memory)$R"
+  else
+    box_line "${FG_LBL}(no GPU partitions found; set SLURMTOP_PARTITIONS to choose some)$R"
+  fi
+  box_bottom
+
+  box_top "$BOX_DISK" "storage"
+  while read -r path sz used pct; do
+    [[ $pct =~ ^[0-9]+$ ]] || continue
+    box_line "$(printf '%-28s %s %s of %s %s(%s%%)%s' "$path" "$(bar "$w" "$pct" 0 100)" "$used" "$sz" "$FG_LBL" "$pct" "$R")"
+  done <<< "$STORAGE"
+  [ -n "$STORAGE" ] || box_line "${FG_LBL}(not read yet, or no path found; see SLURMTOP_PATHS)$R"
+  if (( once )); then box_bottom; else box_bottom "r refresh · q quit"; fi
+}
+
+if (( once )); then query; draw; exit 0; fi
+HOME_=$(tput home 2>/dev/null) EL=$(tput el 2>/dev/null) ED=$(tput ed 2>/dev/null)
+trap 'tput cnorm 2>/dev/null; echo' EXIT
+trap 'resized=1' WINCH
+tput civis 2>/dev/null; clear
+resized=0
+while true; do
+  (( resized )) || query   # a resize only redraws; Slurm is asked on schedule or on r
+  resized=0
+  frame=$(draw)
+  # overwrite in place, clearing each line's leftover end, instead of blanking the screen first
+  printf '%s%s%s%s' "$HOME_" "${frame//$'\n'/$EL$'\n'}" "$EL" "$ED"
+  # wait in 1 s steps so a resize is redrawn promptly (bash's read is not woken by SIGWINCH)
+  for (( t = 0; t < interval && ! resized; t++ )); do
+    if read -rsn1 -t 1 key; then
+      case "$key" in q|Q) exit 0 ;; r|R) last_query=0 ;; esac
+      break
+    elif (( $? <= 128 )); then sleep 1  # no keyboard (input closed): wait instead of spinning
+    fi
+  done
+done
