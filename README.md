@@ -1,7 +1,7 @@
 # slurmtop
 
-A single-file Bash dashboard for your Slurm jobs, their priority, how busy the GPU
-partitions are, and your storage, refreshed live in the terminal.
+A single-file Bash dashboard for your Slurm jobs, their priority, your usage, how busy the
+GPU partitions are, and your storage, refreshed live in the terminal.
 
 ![slurmtop screenshot](screenshot.png)
 
@@ -10,12 +10,16 @@ partitions are, and your storage, refreshed live in the terminal.
 - Your jobs, including job arrays, in a compact table: state, run time, time limit, CPUs,
   memory, GPUs, priority, expected start, and the nodes or the reason a job is waiting
 - The priority breakdown of your pending jobs and the fair-share of your accounts
+- Your usage: CPU-hours, GPU-hours (also by GPU type) and jobs for the last hour, the last
+  7 days, this month, and this year; this month's jobs by final state; and how much of the
+  allocated CPU time, the requested memory, and the time limit your finished jobs used, with
+  the latest finished jobs listed (like `seff`)
 - GPU partitions at a glance: GPUs used, down, and free, idle nodes, and how many jobs are
   waiting (other users' jobs appear only as counts)
 - Storage use for the paths you choose
 - Runs on a cluster login node, or on your own computer over ssh, reusing one connection
-- Light on the scheduler: Slurm is asked at most every 15 seconds and storage every
-  10 minutes, whatever the refresh interval
+- Light on the scheduler: Slurm is asked at most every 15 seconds, and its accounting and
+  storage every 10 minutes, whatever the refresh interval
 - Redraws in place without flicker; `r` refreshes now, `q` quits
 - Rounded panels and gradient meters in 256-color terminals, with fallbacks for basic and
   non-UTF-8 terminals
@@ -23,8 +27,9 @@ partitions are, and your storage, refreshed live in the terminal.
 ## Requirements
 
 - On the machine that runs it: Bash 4+, `awk`, `tput`, and `ssh` when Slurm runs elsewhere
-- On the cluster: the Slurm commands `squeue`, `sprio`, `sshare`, and `scontrol`, plus
-  `awk`, `df`, and `timeout`
+- On the cluster: the Slurm commands `squeue`, `sprio`, `sshare`, `scontrol`, and `sacct`,
+  plus `awk`, `df`, GNU `date`, and `timeout`. The usage panel needs Slurm accounting
+  (`slurmdbd`); without it the panel says so and the rest works as before
 - For use over ssh: a login that needs no password prompt (an ssh key or agent)
 
 ## Install
@@ -92,6 +97,11 @@ export SLURMTOP_PATHS='~ /scratch/$USER'
   can still be unusable when its node has no free CPUs or memory.
 - "jobs waiting" counts every user's pending jobs that may run in the partition; a job
   submitted to several partitions counts in each of them.
+- Usage counts only the part of each job's run inside the period, and running jobs up to
+  now. It is based on what jobs were allocated, not on how busy their CPUs or GPUs were.
+- Efficiency compares what finished jobs used with what they asked for: CPU time with
+  elapsed time × CPUs, peak memory (`MaxRSS`) with requested memory, and run time with the
+  time limit. Values below 50% are highlighted. GPU utilization is not included.
 - Storage shows what `df` reports for each path: the size of the file system, or your
   quota on file systems that report quotas as their size.
 

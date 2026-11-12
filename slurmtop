@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# slurmtop [INTERVAL] [--once]: live view of your Slurm jobs, their priority, how busy the
-# GPU partitions are, and your storage.
+# slurmtop [INTERVAL] [--once]: live view of your Slurm jobs, their priority, your usage, how
+# busy the GPU partitions are, and your storage.
 #   INTERVAL: 1s to 1h, as 30, 30s, 5m or 1h (default 1m). Keys: r refresh now, q quit.
 #   --once: print one screen and exit.
 # Runs on a cluster login node, or on any other machine through ssh (set SLURMTOP_HOST; one
 # shared connection is reused). Slurm is asked at most every 15 s whatever the interval
-# (lighter on the scheduler); storage every 10 min. Other users appear only as counts.
+# (lighter on the scheduler); accounting and storage every 10 min. Other users appear only
+# as counts.
 # Settings (environment variables):
 #   SLURMTOP_HOST        ssh host to run the Slurm commands on, when Slurm is not installed here
 #   SLURMTOP_PARTITIONS  GPU partitions to show (default: those your accounts may use)
@@ -13,7 +14,7 @@
 #   SLURMTOP_PATHS       paths on the cluster to show storage for; ~ and $USER are expanded
 #                        there (default: ~)
 HOST=${SLURMTOP_HOST:-}
-MIN_QUERY=15 STORAGE_EVERY=600
+MIN_QUERY=15 SLOW_EVERY=600
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/slurmtop-%C" -o ControlPersist=15m)
 
 interval=60 once=0
@@ -35,7 +36,7 @@ fi
 
 # Colors only on a terminal: a 256-color palette when available, basic colors otherwise.
 B= D= R= RED= GRN= YEL= CYN= FG_OFF= FG_LBL= FG_TXT= FG_TITLE= DOWNC=
-BOX_JOBS= BOX_PRIO= BOX_PART= BOX_DISK=
+BOX_JOBS= BOX_PRIO= BOX_USE= BOX_PART= BOX_DISK=
 GC=("" "" "" "" "" "" "" "" "" "")
 ncolors=$(tput colors 2>/dev/null || echo 0)
 if [ -t 1 ] && [ "$ncolors" -ge 8 ]; then
@@ -44,10 +45,10 @@ if [ -t 1 ] && [ "$ncolors" -ge 8 ]; then
     GC=(); for c in 41 77 113 149 185 221 215 209 203 197; do GC+=($'\e[38;5;'"$c"'m'); done  # green -> red
     FG_OFF=$'\e[38;5;237m' FG_LBL=$'\e[38;5;245m' FG_TXT=$'\e[38;5;252m' FG_TITLE=$'\e[1;38;5;231m'
     DOWNC=$'\e[38;5;136m' GRN=$'\e[38;5;41m' YEL=$'\e[38;5;221m'
-    BOX_JOBS=$'\e[38;5;72m' BOX_PRIO=$'\e[38;5;179m' BOX_PART=$'\e[38;5;104m' BOX_DISK=$'\e[38;5;174m'
+    BOX_JOBS=$'\e[38;5;72m' BOX_PRIO=$'\e[38;5;179m' BOX_USE=$'\e[38;5;110m' BOX_PART=$'\e[38;5;104m' BOX_DISK=$'\e[38;5;174m'
   else
     GC=("$GRN" "$GRN" "$GRN" "$GRN" "$YEL" "$YEL" "$YEL" "$RED" "$RED" "$RED")
-    FG_OFF=$D FG_LBL=$D FG_TITLE=$B DOWNC=$YEL BOX_JOBS=$CYN BOX_PRIO=$CYN BOX_PART=$CYN BOX_DISK=$CYN
+    FG_OFF=$D FG_LBL=$D FG_TITLE=$B DOWNC=$YEL BOX_JOBS=$CYN BOX_PRIO=$CYN BOX_USE=$CYN BOX_PART=$CYN BOX_DISK=$CYN
   fi
 fi
 # Glyphs: colored meters tell used/down/free apart by color, plain ones by shape.
@@ -149,6 +150,88 @@ jobs_table() {
     }'
 }
 
+# sacct rows "JobID|Start|End|NCPUS|AllocTRES" (times in epoch seconds) and the line
+# "NOW HOUR WEEK MONTH YEAR MONTHDATE YEARDATE" from @@WINDOWS -> CPU-hours, GPU-hours (also by
+# GPU type) and jobs that ran, for the last hour, the last 7 days, this month and this year.
+# Each job counts only for the part of its run inside the period; running jobs count up to now.
+period_lines() {
+  awk -F'|' -v D="$FG_LBL" -v R="$R" -v B="$B" -v W="$1" '
+    function h(x) { return x < 100 ? sprintf("%.1f", x) : sprintf("%.0f", x) }   # hours, one decimal below 100
+    BEGIN { split(W, w, " "); now = w[1]; nw = 4
+            start[1] = w[2]; label[1] = "last hour"; start[2] = w[3]; label[2] = "last 7 days"
+            start[3] = w[4]; label[3] = "since " w[6]; start[4] = w[5]; label[4] = "since " w[7] }
+    $2 ~ /^[0-9]+$/ {
+      e = ($3 ~ /^[0-9]+$/) ? $3 : now; gpu = 0; nt = 0
+      if (match($5, /gres\/gpu=[0-9]+/)) gpu = substr($5, RSTART + 9, RLENGTH - 9) + 0
+      rest = $5
+      while (match(rest, /gres\/gpu:[^=,]+=[0-9]+/)) {
+        t = substr(rest, RSTART + 9, RLENGTH - 9); rest = substr(rest, RSTART + RLENGTH)
+        split(t, kv, "="); ty[++nt] = kv[1]; tn[nt] = kv[2] + 0
+        if (!(kv[1] in known)) { known[kv[1]] = 1; types[++ntypes] = kv[1] }
+      }
+      for (i = 1; i <= nw; i++) {
+        b = ($2 > start[i]) ? $2 : start[i]; if (e <= b) continue
+        d = e - b; jobs[i]++; cpu[i] += d * $4; g[i] += d * gpu
+        for (k = 1; k <= nt; k++) gt[i, ty[k]] += d * tn[k]
+      }
+    }
+    END {
+      printf "%s%-16s %10s %10s %5s  %s%s\n", D, "PERIOD", "CPU-HOURS", "GPU-HOURS", "JOBS", "GPU-HOURS BY TYPE", R
+      for (i = 1; i <= nw; i++) {
+        bt = ""; for (k = 1; k <= ntypes; k++) if (gt[i, types[k]] > 0) bt = bt (bt != "" ? ", " : "") types[k] " " h(gt[i, types[k]] / 3600)
+        printf "%-16s %s%10s%s %s%10s%s %5d  %s\n", label[i], B, h(cpu[i] / 3600), R, B, h(g[i] / 3600), R, jobs[i], bt
+      }
+    }'
+}
+
+# sacct rows "JobID|JobName|State|Elapsed|Timelimit|NCPUS|ReqMem|TotalCPU|MaxRSS" (jobs
+# and their steps) -> your jobs counted by state, how much of the allocated CPU time, the
+# requested memory (at peak) and the time limit finished jobs used, and the latest finished
+# jobs. $1 is the period, such as "since 2026-11-01". Like seff; GPU use is not covered.
+usage_lines() {
+  awk -F'|' -v D="$FG_LBL" -v R="$R" -v Y="$YEL" -v SINCE="$1" -v ROWS=5 '
+    function secs(t,   d, n, a) {  # [D-]HH:MM:SS or MM:SS.mmm -> seconds; -1 for UNLIMITED and the like
+      d = 0; if (t ~ /^[0-9]+-/) { d = substr(t, 1, index(t, "-") - 1); t = substr(t, index(t, "-") + 1) }
+      n = split(t, a, ":")
+      return n == 3 ? d * 86400 + a[1] * 3600 + a[2] * 60 + a[3] : n == 2 ? d * 86400 + a[1] * 60 + a[2] : -1 }
+    function bytes(m,   u) {  # 474620K, 4000M, 64G (or older 64Gn, 2Gc) -> bytes
+      u = m; sub(/[nc]$/, "", u); u = substr(u, length(u))
+      return (m + 0) * (u == "K" ? 1024 : u == "M" ? 1048576 : u == "G" ? 1073741824 : u == "T" ? 1099511627776 : 1) }
+    function cell(a, b, w,   p, s) {  # a/b as a percentage, w wide; below 50% in yellow
+      if (b <= 0) return sprintf("%" w "s", "-")
+      p = int(100 * a / b + 0.5); s = sprintf("%" w "s", p "%")
+      return p < 50 ? Y s R : s }
+    $1 !~ /\./ { id = $1; ids[++n] = id; st = $3; sub(/ .*/, "", st); state[id] = st; name[id] = substr($2, 1, 14)
+                 elr[id] = $4; limr[id] = $5; el[id] = secs($4); lim[id] = secs($5); ncpu[id] = $6; cpu[id] = secs($8)
+                 req[id] = bytes($7) * ($7 ~ /c$/ ? $6 : 1); next }
+    $9 != "" { id = $1; sub(/\..*/, "", id); r = bytes($9); has[id] = 1; if (r > rss[id]) rss[id] = r }
+    END {
+      ended = " COMPLETED FAILED TIMEOUT OUT_OF_MEMORY CANCELLED NODE_FAIL PREEMPTED BOOT_FAIL DEADLINE "
+      for (i = 1; i <= n; i++) {
+        id = ids[i]; cnt[state[id]]++
+        if (index(ended, " " state[id] " ") == 0 || el[id] <= 0) continue   # still waiting or running, or never ran
+        last[++m] = id; core += el[id] * ncpu[id]; used += cpu[id]
+        if (req[id] > 0 && has[id]) { mreq += req[id]; mrss += rss[id] }
+        if (lim[id] > 0) { tl += lim[id]; te += el[id] }
+      }
+      out = D "jobs " SINCE ":" R " " n; sep = " · "
+      k = split("COMPLETED RUNNING PENDING FAILED TIMEOUT OUT_OF_MEMORY CANCELLED", order, " ")
+      for (i = 1; i <= k; i++) if (order[i] in cnt) { out = out sep cnt[order[i]] " " tolower(order[i]); sep = ", "; seen[order[i]] = 1 }
+      for (s in cnt) if (!(s in seen)) { out = out sep cnt[s] " " tolower(s); sep = ", " }
+      gsub(/_/, " ", out); print out
+      if (!m) { print D "(no finished jobs yet)" R; exit }
+      print D "finished jobs used:" R " CPU " cell(used, core, 1) D " of allocated ·" R " memory " cell(mrss, mreq, 1) \
+        D " of requested (peak) ·" R " time " cell(te, tl, 1) D " of limit" R
+      printf "%s%-12s %-14s %-9s %10s %10s %4s %4s %13s %4s%s\n", D, "JOBID", "NAME", "STATE", "ELAPSED", "LIMIT", "CPUS", "CPU%", "MEM PEAK/REQ", "MEM%", R
+      for (i = (m > ROWS ? m - ROWS + 1 : 1); i <= m; i++) {
+        id = last[i]; s = state[id]; if (s == "OUT_OF_MEMORY") s = "OOM"
+        mem = has[id] ? sprintf("%.1fG/%.1fG", rss[id] / 1073741824, req[id] / 1073741824) : "-"
+        printf "%-12s %-14s %-9s %10s %10s %4s %s %13s %s\n", id, name[id], s, elr[id], limr[id], ncpu[id], \
+          cell(cpu[id], el[id] * ncpu[id], 4), mem, (has[id] ? cell(rss[id], req[id], 4) : sprintf("%4s", "-"))
+      }
+    }'
+}
+
 # The Slurm queries, run on the cluster (directly, or through ssh) after a line that sets
 # ACCOUNT, PARTS, PATHS and WANT; output sections start with @@NAME.
 read -r -d '' COLLECT <<'EOF'
@@ -180,7 +263,11 @@ else  # GPU partitions (from the nodes) that your accounts and groups may use
       if (da != "" && any(da, acct)) next
       print p }'
 fi
-if [ "$WANT" = storage ]; then
+if [ "$WANT" = slow ]; then   # Slurm accounting (slurmdbd) and storage, every SLOW_EVERY seconds
+  now=$(date +%s) month=$(date +%Y-%m-01) year=$(date +%Y-01-01)
+  echo "@@WINDOWS"; echo "$now $(( now - 3600 )) $(( now - 7 * 86400 )) $(date -d "$month" +%s) $(date -d "$year" +%s) $month $year"
+  echo "@@USAGE"; SLURM_TIME_FORMAT=%s timeout 30 sacct -u "$USER" -X -n -P -S "$year" -E now -o JobID,Start,End,NCPUS,AllocTRES 2>/dev/null
+  echo "@@FINISHED"; timeout 30 sacct -u "$USER" -n -P -S "$month" -E now -o JobID,JobName,State,Elapsed,Timelimit,NCPUS,ReqMem,TotalCPU,MaxRSS 2>/dev/null
   echo "@@STORAGE"
   for p in $PATHS; do
     p=${p/#\~/$HOME}; p=${p//\$USER/$USER}
@@ -190,13 +277,13 @@ fi
 EOF
 section() { awk -v S="@@$1" '$0 == S {on = 1; next} /^@@[A-Z]+$/ {on = 0} on' <<< "$RAW"; }
 
-last_query=0 last_storage=0
+last_query=0 last_slow=0
 query() {
   local now want=nostorage script
   now=$(date +%s)
   (( now - last_query < MIN_QUERY && last_query > 0 )) && return
   last_query=$now
-  (( now - last_storage >= STORAGE_EVERY )) && want=storage
+  (( now - last_slow >= SLOW_EVERY )) && want=slow
   (( once )) || printf '%s%s%s' "$HOME_" "$(header "${YEL}updating…$R")" "$EL"  # keep the old screen, flag the wait
   script=$(printf 'ACCOUNT=%q PARTS=%q PATHS=%q WANT=%q\n' "${SLURMTOP_ACCOUNT:-}" "${SLURMTOP_PARTITIONS:-}" \
     "${SLURMTOP_PATHS:-~}" "$want"; printf '%s\n' "$COLLECT")
@@ -209,7 +296,9 @@ query() {
   CUSER=$(section USER); CLUSTER=$(section CLUSTER); MYJOBS=$(section MYJOBS); MYSTATES=$(section MYSTATES)
   PRIO=$(section PRIO); FS=$(section FS); PENDING_BY_PART=$(section PENDING); NODES=$(section NODES)
   PARTLIST=$(section PARTS)
-  if [ "$want" = storage ]; then last_storage=$now; STORAGE=$(section STORAGE); fi
+  if [ "$want" = slow ]; then
+    last_slow=$now; STORAGE=$(section STORAGE); WINDOWS=$(section WINDOWS); USAGE=$(section USAGE); FINISHED=$(section FINISHED)
+  fi
 }
 
 size() { cols=$(tput cols 2>/dev/null || echo 100); (( cols < 60 )) && cols=60; }
@@ -220,7 +309,7 @@ header() {  # header [STATUS]: top border of the first panel, with an optional s
 }
 
 draw() {
-  local w r p g fr fs part pw=9
+  local w r p g fr fs part month pw=9
   size
   for part in $PARTLIST; do (( ${#part} > pw )) && pw=${#part}; done   # partition name column
   (( pw > 20 )) && pw=20
@@ -237,6 +326,16 @@ draw() {
   if [ -n "$PRIO" ]; then box_lines <<< "$PRIO"; else box_line "${FG_LBL}(no pending jobs waiting on priority)$R"; fi
   fs=$(awk -F'|' 'NF == 2 && $1 != "" {printf "%s%s %.3f", (n++ ? " · " : ""), $1, $2}' <<< "$FS")
   box_line "${FG_LBL}fair-share$R  ${fs:-?}  ${FG_LBL}(1 = share unused, 0 = used up)$R"
+  box_bottom
+
+  box_top "$BOX_USE" "my usage" "Slurm accounting, every $(( SLOW_EVERY / 60 )) min"
+  if [ -n "$WINDOWS" ] && [ -n "$USAGE$FINISHED" ]; then
+    period_lines "$WINDOWS" <<< "$USAGE" | box_lines
+    read -r _ _ _ _ _ month _ <<< "$WINDOWS"
+    usage_lines "since $month" <<< "$FINISHED" | box_lines
+  else
+    box_line "${FG_LBL}(not read yet, or Slurm accounting is not available here)$R"
+  fi
   box_bottom
 
   box_top "$BOX_PART" "gpu partitions · all users" "${GC[9]}$FULL$R used  $DOWNC$PART$R down  $FG_OFF$EMPTY$R free"
